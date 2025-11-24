@@ -7,6 +7,7 @@ import re
 import time
 import webbrowser
 import smtplib
+from difflib import SequenceMatcher
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
@@ -84,6 +85,10 @@ def load_config():
             os.environ.get("MAX_NEWS_PER_KEYWORD", "").strip() or "0"
         )
         or config_data["report"].get("max_news_per_keyword", 0),
+        "DEDUPLICATION_THRESHOLD": float(
+            os.environ.get("DEDUPLICATION_THRESHOLD", "").strip() or "0"
+        )
+        or config_data["report"].get("deduplication_threshold", 0.78),
         "USE_PROXY": config_data["crawler"]["use_proxy"],
         "DEFAULT_PROXY": config_data["crawler"]["default_proxy"],
         "ENABLE_CRAWLER": os.environ.get("ENABLE_CRAWLER", "").strip().lower()
@@ -945,6 +950,187 @@ def detect_latest_new_titles(current_platform_ids: Optional[List[str]] = None) -
 
 
 # === 统计和分析 ===
+def calculate_title_similarity(title1: str, title2: str) -> float:
+    """
+    计算两个标题的相似度（0-1之间）
+    使用多种策略综合判断：
+    1. 字符级相似度（SequenceMatcher）
+    2. 子串包含检测（短标题是否为长标题的子集）
+    3. 关键词重叠度
+    4. 长度比例
+    """
+    if not title1 or not title2:
+        return 0.0
+    
+    # 标准化处理
+    t1 = clean_title(title1).lower()
+    t2 = clean_title(title2).lower()
+    
+    if t1 == t2:
+        return 1.0
+    
+    # 1. 字符级相似度（基础相似度）
+    char_similarity = SequenceMatcher(None, t1, t2).ratio()
+    
+    # 2. 子串包含关系（一个标题是另一个的子集）
+    shorter = t1 if len(t1) < len(t2) else t2
+    longer = t2 if len(t1) < len(t2) else t1
+    
+    # 检查短标题是否完全包含在长标题中
+    substring_match = 1.0 if shorter in longer else 0.0
+    
+    # 如果是子串关系，根据长度差异给出较高分数
+    if substring_match > 0:
+        len_ratio = len(shorter) / len(longer)
+        # 如果短标题占长标题的70%以上，认为高度相似
+        if len_ratio >= 0.7:
+            substring_similarity = 0.9 + (len_ratio - 0.7) * 0.33  # 0.9-1.0
+        else:
+            substring_similarity = 0.7 + len_ratio * 0.2  # 0.7-0.84
+    else:
+        substring_similarity = 0
+    
+    # 3. 关键词重叠度（提取2-3字的词组）
+    # 对中文更友好的分词方式
+    def extract_ngrams(text, n=2):
+        """提取n-gram（连续n个字符）"""
+        ngrams = set()
+        for i in range(len(text) - n + 1):
+            ngrams.add(text[i:i+n])
+        return ngrams
+    
+    bigrams1 = extract_ngrams(t1, 2)
+    bigrams2 = extract_ngrams(t2, 2)
+    trigrams1 = extract_ngrams(t1, 3)
+    trigrams2 = extract_ngrams(t2, 3)
+    
+    # 计算bigram和trigram的Jaccard相似度
+    if bigrams1 and bigrams2:
+        bigram_similarity = len(bigrams1 & bigrams2) / len(bigrams1 | bigrams2)
+    else:
+        bigram_similarity = 0
+    
+    if trigrams1 and trigrams2:
+        trigram_similarity = len(trigrams1 & trigrams2) / len(trigrams1 | trigrams2)
+    else:
+        trigram_similarity = 0
+    
+    # 4. 长度比例（长度过于悬殊则降低相似度）
+    len_ratio = min(len(t1), len(t2)) / max(len(t1), len(t2)) if max(len(t1), len(t2)) > 0 else 1
+    
+    # 综合相似度计算（根据不同情况调整权重）
+    if substring_similarity > 0:
+        # 如果存在子串关系，子串相似度权重更高
+        final_similarity = (
+            char_similarity * 0.2 +
+            substring_similarity * 0.5 +
+            bigram_similarity * 0.15 +
+            trigram_similarity * 0.15
+        )
+    else:
+        # 普通情况，综合多个指标
+        final_similarity = (
+            char_similarity * 0.3 +
+            bigram_similarity * 0.3 +
+            trigram_similarity * 0.25 +
+            len_ratio * 0.15
+        )
+    
+    return final_similarity
+
+
+def deduplicate_similar_titles(titles: List[Dict], similarity_threshold: float = 0.85) -> List[Dict]:
+    """
+    去除相似的重复标题
+    
+    策略：
+    1. 保留权重更高的标题
+    2. 合并相似标题的信息（来源、排名等）
+    3. 可配置相似度阈值（默认0.85，即85%以上相似视为重复）
+    
+    Args:
+        titles: 标题列表，每个元素包含 title、source_name、ranks 等信息
+        similarity_threshold: 相似度阈值，默认0.85
+    
+    Returns:
+        去重后的标题列表
+    """
+    if not titles or len(titles) <= 1:
+        return titles
+    
+    # 用于标记已被合并的标题索引
+    merged_indices = set()
+    deduplicated = []
+    
+    for i, title1_data in enumerate(titles):
+        if i in merged_indices:
+            continue
+        
+        # 找到所有与当前标题相似的标题
+        similar_group = [title1_data]
+        similar_indices = [i]
+        
+        for j in range(i + 1, len(titles)):
+            if j in merged_indices:
+                continue
+            
+            title2_data = titles[j]
+            similarity = calculate_title_similarity(
+                title1_data["title"],
+                title2_data["title"]
+            )
+            
+            # 如果相似度超过阈值，认为是重复
+            if similarity >= similarity_threshold:
+                similar_group.append(title2_data)
+                similar_indices.append(j)
+                merged_indices.add(j)
+        
+        # 合并相似标题的信息
+        if len(similar_group) > 1:
+            # 选择权重最高的作为主标题
+            main_title = max(
+                similar_group,
+                key=lambda x: (
+                    calculate_news_weight(x),
+                    -min(x["ranks"]) if x["ranks"] else 999,
+                    x["count"]
+                )
+            )
+            
+            # 合并所有来源信息
+            all_sources = []
+            all_ranks = []
+            total_count = 0
+            
+            for title_data in similar_group:
+                source = title_data.get("source_name", "")
+                if source and source not in all_sources:
+                    all_sources.append(source)
+                
+                ranks = title_data.get("ranks", [])
+                all_ranks.extend(ranks)
+                
+                total_count += title_data.get("count", 1)
+            
+            # 更新主标题的信息
+            merged_title = main_title.copy()
+            merged_title["count"] = total_count
+            merged_title["ranks"] = sorted(set(all_ranks)) if all_ranks else merged_title["ranks"]
+            
+            # 如果有多个来源，可以在source_name中体现
+            if len(all_sources) > 1:
+                # 保留主标题的source_name，但可以在调试时看到合并了多少个
+                pass  # 这里可以选择是否修改source_name
+            
+            deduplicated.append(merged_title)
+        else:
+            # 没有相似的，直接添加
+            deduplicated.append(title1_data)
+    
+    return deduplicated
+
+
 def calculate_news_weight(
     title_data: Dict, rank_threshold: int = CONFIG["RANK_THRESHOLD"]
 ) -> float:
@@ -1377,6 +1563,15 @@ def count_word_frequency(
                 -x["count"],
             ),
         )
+
+        # 🆕 智能去重：去除相似的重复标题
+        # 相似度阈值可在config.yaml中配置，默认0.85
+        dedup_threshold = CONFIG.get("DEDUPLICATION_THRESHOLD", 0.85)
+        original_count = len(sorted_titles)
+        sorted_titles = deduplicate_similar_titles(sorted_titles, dedup_threshold)
+        dedup_count = original_count - len(sorted_titles)
+        if dedup_count > 0:
+            print(f"  ✓ [{group_key}] 去重：{original_count} 条 → {len(sorted_titles)} 条（移除 {dedup_count} 条重复）")
 
         # 应用最大显示数量限制（优先级：单独配置 > 全局配置）
         group_max_count = group_key_to_max_count.get(group_key, 0)
